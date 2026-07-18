@@ -84,61 +84,31 @@ class FindAssignableAllocationService
 
         $ip = $server->allocation->ip;
 
-        // Get all ports already assigned to any server on this node/ip within the range.
-        // Unassigned allocations (server_id = null) are still considered available.
-        $usedPorts = $server->node->allocations()
+        // 只从节点上已有的未分配 allocation 记录中查找连续端口。
+        $existingUnassigned = $server->node->allocations()
             ->where('ip', $ip)
             ->whereBetween('port', [$start, $end])
-            ->whereNotNull('server_id')
+            ->whereNull('server_id')
+            ->orderBy('port')
             ->pluck('port')
             ->toArray();
 
-        $available = array_values(array_diff(range((int) $start, (int) $end), $usedPorts));
-
-        // Build a set of available ports for O(1) lookup, then shuffle the ports so that
-        // the starting candidate is chosen randomly — mirroring how single-port allocation
-        // uses array_rand to avoid always picking from the beginning of the range.
-        $availableSet = array_flip($available);
-        shuffle($available);
-
-        $consecutiveStart = null;
-        foreach ($available as $candidate) {
-            $valid = true;
-            for ($j = 1; $j < $count; ++$j) {
-                if (!isset($availableSet[$candidate + $j])) {
-                    $valid = false;
-                    break;
-                }
-            }
-            if ($valid) {
-                $consecutiveStart = $candidate;
-                break;
-            }
+        if (empty($existingUnassigned)) {
+            throw new NoAutoAllocationSpaceAvailableException(
+                '无法分配更多连续端口：节点上没有可用的未分配端口记录。'
+            );
         }
 
+        $consecutiveStart = $this->findConsecutiveBlock($existingUnassigned, $count);
+
         if ($consecutiveStart === null) {
-            throw new NoAutoAllocationSpaceAvailableException();
+            throw new NoAutoAllocationSpaceAvailableException(
+                '无法分配更多连续端口：节点上已有的未分配端口不足以组成连续的端口块。'
+            );
         }
 
         $ports = range($consecutiveStart, $consecutiveStart + $count - 1);
 
-        // Create any ports in the range that don't already exist as allocations.
-        $existingPorts = $server->node->allocations()
-            ->where('ip', $ip)
-            ->whereIn('port', $ports)
-            ->pluck('port')
-            ->toArray();
-
-        $newPorts = array_values(array_diff($ports, $existingPorts));
-
-        if (!empty($newPorts)) {
-            $this->service->handle($server->node, [
-                'allocation_ip' => $ip,
-                'allocation_ports' => $newPorts,
-            ]);
-        }
-
-        // Assign all the consecutive allocations to the server.
         $allocations = $server->node->allocations()
             ->where('ip', $ip)
             ->whereIn('port', $ports)
@@ -146,7 +116,9 @@ class FindAssignableAllocationService
             ->get();
 
         if ($allocations->count() !== $count) {
-            throw new NoAutoAllocationSpaceAvailableException();
+            throw new NoAutoAllocationSpaceAvailableException(
+                '无法分配更多连续端口：节点上已有的未分配端口不足以组成连续的端口块。'
+            );
         }
 
         $allocations->each(function (Allocation $allocation) use ($server) {
@@ -154,6 +126,33 @@ class FindAssignableAllocationService
         });
 
         return $allocations->map(fn (Allocation $a) => $a->refresh())->all();
+    }
+
+    /**
+     * 在排序后的端口数组中查找第一个连续块。
+     *
+     * @param int[] $ports 已排序的端口数组
+     * @param int $count 需要的连续端口数量
+     * @return int|null 连续块的起始端口，如果没有找到则返回 null
+     */
+    private function findConsecutiveBlock(array $ports, int $count): ?int
+    {
+        $portSet = array_flip($ports);
+
+        foreach ($ports as $candidate) {
+            $valid = true;
+            for ($j = 1; $j < $count; ++$j) {
+                if (!isset($portSet[$candidate + $j])) {
+                    $valid = false;
+                    break;
+                }
+            }
+            if ($valid) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     /**
